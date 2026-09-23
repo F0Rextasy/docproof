@@ -1,6 +1,6 @@
 ---
 name: docproof
-description: Verifies that Markdown documentation still tells the truth -- parses every fenced code block with a deterministic per-language checker (python ast, json, node --check, bash -n, console sessions line-by-line). Use when docs may have drifted: before a release, after an API rename, in CI on every PR. Exit 1 means a snippet is broken; no model ever reads your docs.
+description: Verifies that Markdown documentation still tells the truth -- parses every fenced code block with a deterministic per-language checker (python ast, json, node --check, bash -n, console sessions line-by-line). Use when docs may have drifted - before a release, after an API rename, in CI on every PR. Exit 1 means a snippet is broken; no model ever reads your docs.
 license: MIT
 compatibility: Requires Python 3.8+; node/bash only for their languages (absent checker = warning, never a guess). Works in Claude Code, Codex, Cursor, and any Agent Skills compatible client.
 metadata:
