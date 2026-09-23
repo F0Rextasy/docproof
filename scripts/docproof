@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""docproof -- catch documentation that stopped telling the truth.
+
+Scans Markdown fenced code blocks and runs a deterministic checker per
+declared language (no model, no network, no telemetry):
+
+    python     ast.parse
+    json       json.loads
+    javascript node --check   (probed; --node overrides)
+    bash/sh    bash -n        (probed; --bash overrides)
+    console    bash -n over `$ `-prompted command lines only
+
+Default mode never executes a snippet; --run opts python/bash blocks into
+a timed subprocess to catch runtime lies. Console sessions are never
+executed (they often contain install commands). Exit 0 = every checkable
+snippet verified, 1 = a snippet is broken (the docs lie), 2 = usage error.
+"""
+
+import argparse
+import ast
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})[ \t]*(\S*)[ \t]*(.*)$")
+IGNORE_MARK = "<!-- docproof-ignore"
+NONCODE = {"text", "txt", "plain", "diff", "output", "mermaid", "irc", "csv", "ansi"}
+CONSOLE_LANGS = {"console", "shell-session", "shellsession", "terminal"}
+ALIASES = {"py": "python", "python3": "python", "js": "javascript",
+           "node": "javascript", "mjs": "javascript", "cjs": "javascript",
+           "sh": "bash", "shell": "bash", "zsh": "bash"}
+
+BOLD = "\033[1m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+PLAIN = {BOLD: "", RED: "", YELLOW: "", DIM: "", RESET: ""}
+
+
+def paint(text, *codes, color=True):
+    if not color:
+        return text
+    return "".join(codes) + text + RESET
+
+
+def extract_blocks(path, lines):
+    """Fenced blocks as dicts: file, line (1-based), lang, attrs, code, ignored."""
+    blocks = []
+    i, n = 0, len(lines)
+    while i < n:
+        match = FENCE_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        indent, fence, lang, attrs = match.groups()
+        closing = re.compile(r"^[ \t]*%s{%d,}[ \t]*$"
+                             % (re.escape(fence[0]), len(fence)))
+        j = i + 1
+        while j < n and not closing.match(lines[j]):
+            j += 1
+        code = "\n".join(lines[i + 1:j])
+        if indent:
+            code = re.sub(r"(?m)^[ \t]{0,%d}" % len(indent), "", code)
+        ignored = any(IGNORE_MARK in lines[k] for k in (i - 1, i - 2) if k >= 0)
+        blocks.append({"file": path, "line": i + 1, "lang": lang.lower(),
+                       "attrs": attrs, "code": code, "ignored": ignored})
+        i = j + 1
+    return blocks
+
+
+def console_commands(code):
+    """Command lines of a console session: `$ `-prompted lines plus their
+    continuations; output lines are never commands and never verified."""
+    commands, continuation = [], False
+    for line in code.splitlines():
+        stripped = line.strip()
+        if continuation:
+            commands.append(line)
+            continuation = stripped.endswith("\\")
+        elif stripped.startswith("$ "):
+            commands.append(stripped[2:])
+            continuation = stripped[2:].endswith("\\")
+    return "\n".join(commands)
+
+
+class Checkers:
+    """Lazily resolves and sanity-probes checker binaries.
+
+    `--version` probe: a PATH `bash` that is actually the WSL stub on a
+    distribution-less Windows answers rc=1 with an error banner -- a
+    present-but-broken checker must warn, never fabricate verdicts."""
+
+    def __init__(self, bash=None, node=None):
+        self._explicit = {"bash": bash, "node": node}
+        self._resolved = {}
+
+    def get(self, name):
+        if name not in self._resolved:
+            candidate = self._explicit.get(name) or shutil.which(name)
+            if not candidate:
+                self._resolved[name] = (None, "checker '%s' not found -- not verified" % name)
+            else:
+                try:
+                    probe = subprocess.run([candidate, "--version"],
+                                           capture_output=True, timeout=15)
+                    usable = probe.returncode == 0
+                except (OSError, subprocess.SubprocessError):
+                    usable = False
+                self._resolved[name] = (
+                    candidate, None if usable else
+                    "checker '%s' exists but is not usable -- not verified" % name)
+        return self._resolved[name]
+
+
+def _temp(content, suffix):
+    handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False,
+                                         encoding="utf-8")
+    handle.write(content)
+    handle.close()
+    return handle.name
+
+
+def python_verdict(blk, opts):
+    code = blk["code"]
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return "fail", "python syntax error (line %s): %s" % (exc.lineno, exc.msg)
+    if not opts.run:
+        return "ok", "parsed"
+    path = _temp(code, ".py")
+    try:
+        proc = subprocess.run([sys.executable, path], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=opts.timeout, cwd=os.getcwd())
+    except subprocess.TimeoutExpired:
+        return "fail", "execution timed out after %ss" % opts.timeout
+    finally:
+        os.unlink(path)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return "fail", "execution exited %d%s" % (
+            proc.returncode,
+            (": " + tail[-1]) if tail else "")
+    return "ok", "executed (exit 0)"
+
+
+def json_verdict(blk, opts):
+    try:
+        json.loads(blk["code"])
+    except ValueError as exc:
+        return "fail", "invalid json: %s" % exc
+    return "ok", "parsed"
+
+
+def bash_syntax(script, checkers):
+    binary, problem = checkers.get("bash")
+    if problem:
+        return "warn", problem
+    path = _temp(script, ".sh")
+    try:
+        proc = subprocess.run([binary, "-n", path], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=30)
+    except subprocess.TimeoutExpired:
+        return "fail", "bash -n timed out"
+    finally:
+        os.unlink(path)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return "fail", tail[-1] if tail else "bash -n: syntax error"
+    return "ok", "bash -n passed"
+
+
+def bash_verdict(blk, opts, checkers):
+    level, message = bash_syntax(blk["code"], checkers)
+    if level != "ok" or not opts.run:
+        return level, message
+    binary, _ = checkers.get("bash")
+    path = _temp(blk["code"], ".sh")
+    try:
+        proc = subprocess.run([binary, path], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=opts.timeout, cwd=os.getcwd())
+    except subprocess.TimeoutExpired:
+        return "fail", "execution timed out after %ss" % opts.timeout
+    finally:
+        os.unlink(path)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return "fail", "execution exited %d%s" % (
+            proc.returncode, (": " + tail[-1]) if tail else "")
+    return "ok", "bash -n passed, executed (exit 0)"
+
+
+def console_verdict(blk, opts, checkers):
+    script = console_commands(blk["code"])
+    if not script.strip():
+        return "skipped", "no command lines in session (output only)"
+    # Never executed, even with --run: console sessions often contain
+    # install commands.
+    return bash_syntax(script, checkers)
+
+
+def js_verdict(blk, opts, checkers):
+    binary, problem = checkers.get("node")
+    if problem:
+        return "warn", problem
+    code = blk["code"]
+    module = bool(re.search(r"(?m)^\s*(import|export)\s", code))
+    path = _temp(code, ".mjs" if module else ".js")
+    try:
+        proc = subprocess.run([binary, "--check", path], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=30)
+    except subprocess.TimeoutExpired:
+        return "fail", "node --check timed out"
+    finally:
+        os.unlink(path)
+    if proc.returncode != 0:
+        lines = [l for l in (proc.stderr or proc.stdout or "").splitlines()
+                 if l.strip() and not l.startswith("Node.js")]
+        # node's tail is an internal stack frame; the verdict line is the Error:
+        tail = [l for l in lines if "Error:" in l] or lines
+        return "fail", tail[-1] if tail else "node --check: syntax error"
+    return "ok", "node --check passed"
+
+
+def verdict(blk, opts, checkers):
+    """(level, message); level in ok | fail | warn | unchecked | skipped."""
+    if blk["ignored"]:
+        return "skipped", "docproof-ignore comment above the block"
+    if "skip" in blk["attrs"].split():
+        return "skipped", "skip marker in info string"
+    lang = blk["lang"]
+    if not lang:
+        return "skipped", "no language tag -- not verified"
+    canon = ALIASES.get(lang, lang)
+    if lang in NONCODE or canon in NONCODE:
+        return "skipped", "non-code block (%s)" % lang
+    if canon in CONSOLE_LANGS:
+        return console_verdict(blk, opts, checkers)
+    if canon == "python":
+        return python_verdict(blk, opts)
+    if canon == "json":
+        return json_verdict(blk, opts)
+    if canon == "javascript":
+        return js_verdict(blk, opts, checkers)
+    if canon == "bash":
+        return bash_verdict(blk, opts, checkers)
+    return "unchecked", "no checker for language '%s'" % lang
+
+
+def collect(paths):
+    files = []
+    for path in paths:
+        if os.path.isdir(path):
+            for root, dirs, names in os.walk(path):
+                dirs[:] = [d for d in dirs
+                           if d not in {".git", "node_modules", "__pycache__"}]
+                for name in sorted(names):
+                    if name.lower().endswith((".md", ".markdown", ".mdown")):
+                        files.append(os.path.join(root, name))
+        elif os.path.isfile(path):
+            files.append(path)
+        else:
+            print("docproof: cannot read %s" % path, file=sys.stderr)
+            sys.exit(2)
+    files = sorted(set(files))
+    if not files:
+        print("docproof: no markdown files found", file=sys.stderr)
+        sys.exit(2)
+    return files
+
+
+def render(findings, counts, strict, color):
+    levels = {"fail": ("FAIL", RED, BOLD),
+              "warn": ("WARN", YELLOW, BOLD),
+              "unchecked": ("INFO", DIM,),
+              "skipped": ("SKIP", DIM,)}
+    width = min(34, max(
+        [len("%s:%d" % (f["file"], f["line"])) for f in findings] or [8]))
+    for finding in findings:
+        label, *codes = levels[finding["level"]]
+        ref = "%s:%d" % (finding["file"], finding["line"])
+        print("%-*s  %s  %-11s %s" % (width, ref,
+                                      paint(label, *codes, color=color),
+                                      finding["lang"], finding["message"]))
+    if findings and counts:
+        print()
+    tail = "%d checked, %d unchecked, %d skipped" % (
+        counts["checked"], counts["unchecked"], counts["skipped"])
+    if counts["warn"]:
+        tail += ", %d not verified (checker problem)" % counts["warn"]
+    if counts["fail"]:
+        print(paint("docproof: %d snippet(s) broken -- the docs lie; "
+                    "fix before merge (%s)" % (counts["fail"], tail),
+                    BOLD, RED, color=color))
+    else:
+        print(paint("docproof: ok -- " + tail, BOLD, color=color))
+    if strict and counts["warn"]:
+        print(paint("docproof: --strict blocks on %d checker problem(s)"
+                    % counts["warn"], BOLD, RED, color=color))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="docproof",
+        description="Verify that Markdown code snippets still parse "
+                    "(or run) -- docs that lie fail CI.")
+    parser.add_argument("paths", nargs="+",
+                        help="markdown files or directories to verify")
+    parser.add_argument("--run", action="store_true",
+                        help="execute python/bash snippets (timed) instead "
+                             "of parse-only; console sessions are never run")
+    parser.add_argument("--timeout", type=float, default=10.0,
+                        help="seconds per snippet in --run mode (default 10)")
+    parser.add_argument("--bash", metavar="PATH",
+                        help="bash binary (default: PATH lookup + probe)")
+    parser.add_argument("--node", metavar="PATH",
+                        help="node binary (default: PATH lookup + probe)")
+    parser.add_argument("--strict", action="store_true",
+                        help="checker problems (warn) block too")
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--no-color", action="store_true")
+    opts = parser.parse_args(argv)
+
+    files = collect(opts.paths)
+    checkers = Checkers(bash=opts.bash, node=opts.node)
+    findings = []
+    counts = {"checked": 0, "fail": 0, "warn": 0, "unchecked": 0,
+              "skipped": 0}
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            print("docproof: cannot read %s" % path, file=sys.stderr)
+            sys.exit(2)
+        for blk in extract_blocks(path, lines):
+            level, message = verdict(blk, opts, checkers)
+            if level == "ok":
+                counts["checked"] += 1
+                continue
+            counts[level] += 1
+            findings.append({"file": path, "line": blk["line"],
+                             "lang": blk["lang"] or "-",
+                             "level": level, "message": message})
+    ok = counts["fail"] == 0 and not (opts.strict and counts["warn"] > 0)
+    if opts.format == "json":
+        print(json.dumps({"ok": ok, "counts": counts, "findings": findings},
+                         indent=2))
+    else:
+        render(findings, counts, opts.strict, not opts.no_color)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
